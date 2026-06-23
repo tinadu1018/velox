@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   windows-build:
-    if: ${{ github.repository == 'facebookincubator/velox' }}
+    if: true  # CI test on fork (do NOT keep in upstream PR)
     name: windows-2022-${{ matrix.type }}
     strategy:
       fail-fast: false
