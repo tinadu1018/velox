@@ -18,9 +18,11 @@
 name: Windows Build
 
 on:
+  workflow_dispatch: {}
   push:
     branches:
       - main
+      - users/tiadu/windows-ci-validation
     paths:
       - velox/**
       - '!velox/docs/**'
@@ -41,52 +43,73 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.head_ref || github.sha }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   windows-build:
-    if: ${{ github.repository == 'facebookincubator/velox' }}
     name: windows-2022-${{ matrix.type }}
     strategy:
       fail-fast: false
       matrix:
         type: [release]
     runs-on: windows-2022
+    timeout-minutes: 360
     env:
-      # vcpkg binary caching via GitHub Actions cache: deps build once, then restore.
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      VCPKG_ROOT: ${{ github.workspace }}\.ci\vcpkg
+      VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}\vcpkg-binary-cache,readwrite
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
 
-      # Required for the vcpkg "x-gha" binary cache backend.
-      - name: Export GitHub Actions cache env
-        uses: actions/github-script@v7
+      - name: Checkout vcpkg
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          repository: microsoft/vcpkg
+          # Match the dependency baseline in windows/vcpkg.
+          ref: d1ff36c6520ee43f1a656c03cd6425c2974a449e
+          path: .ci/vcpkg
+          persist-credentials: false
 
-      # Provides FlexLexer.h (included by the pre-generated scanners). The parsers
-      # themselves are committed pre-generated, so bison/flex are not run.
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\vcpkg-binary-cache" -Force | Out-Null
+          git rev-parse HEAD
+          & "$env:VCPKG_ROOT\vcpkg.exe" version
+
+      - name: Restore dependency binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: windows-vcpkg-v1-${{ hashFiles('windows/vcpkg/*.json', 'windows/oss-triplets/*.cmake', '.github/workflows/windows.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            windows-vcpkg-v1-${{ hashFiles('windows/vcpkg/*.json', 'windows/oss-triplets/*.cmake', '.github/workflows/windows.yml') }}-
+
       - name: Install WinFlexBison
+        # Provides FlexLexer.h for the pre-generated scanners.
         shell: pwsh
         run: |
           choco install winflexbison3 --no-progress -y
-          $h = Get-ChildItem "$env:ChocolateyInstall\lib\winflexbison3" -Recurse -Filter FlexLexer.h -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($h) {
-            "FLEX_INCLUDE_DIRS=$($h.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            $h.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $flexHeader = Get-ChildItem "$env:ChocolateyInstall\lib\winflexbison3" -Recurse -Filter FlexLexer.h |
+            Select-Object -First 1
+          if (-not $flexHeader) {
+            throw "WinFlexBison did not install the required FlexLexer.h header."
           }
+          "FLEX_INCLUDE_DIRS=$($flexHeader.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $flexHeader.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B _build/release -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DVCPKG_OVERLAY_TRIPLETS="$PWD/windows/oss-triplets" `
             -DVCPKG_MANIFEST_DIR="$PWD/windows/vcpkg" `
@@ -101,8 +124,35 @@ jobs:
             -DVELOX_ENABLE_GEO=OFF -DVELOX_ENABLE_HIVE_CONNECTOR=OFF `
             -DVELOX_ENABLE_PARQUET=OFF -DVELOX_ENABLE_TPCDS_CONNECTOR=OFF `
             -DVELOX_ENABLE_ARROW=ON -DVELOX_ENABLE_PRESTO_FUNCTIONS=ON `
-            -DVELOX_ENABLE_SPARK_FUNCTIONS=ON -DVELOX_ENABLE_ICEBERG_FUNCTIONS=ON
+            -DVELOX_ENABLE_SPARK_FUNCTIONS=ON -DVELOX_ENABLE_ICEBERG_FUNCTIONS=ON `
+            2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\velox-configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build
         shell: pwsh
-        run: cmake --build _build/release --config Release -- /m
+        run: |
+          cmake --build _build/release --config Release -- /m `
+            2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\velox-build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Save dependency binaries
+        # Preserve completed dependency builds even when Velox itself fails.
+        if: ${{ always() && !cancelled() && steps.vcpkg-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Upload build logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-${{ matrix.type }}-logs
+          path: |
+            ${{ runner.temp }}\velox-configure.log
+            ${{ runner.temp }}\velox-build.log
+            _build/release/CMakeFiles/CMakeConfigureLog.yaml
+            _build/release/vcpkg-manifest-install.log
+            .ci/vcpkg/buildtrees/**/*.log
+          include-hidden-files: true
+          retention-days: 7
