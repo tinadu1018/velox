@@ -92,6 +92,7 @@ jobs:
           key: windows-vcpkg-v1-${{ hashFiles('windows/vcpkg/*.json', 'windows/oss-triplets/*.cmake', '.github/workflows/windows.yml') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             windows-vcpkg-v1-${{ hashFiles('windows/vcpkg/*.json', 'windows/oss-triplets/*.cmake', '.github/workflows/windows.yml') }}-
+            windows-vcpkg-v1-
 
       - name: Install WinFlexBison
         # Provides FlexLexer.h for the pre-generated scanners.
@@ -155,6 +156,6 @@ jobs:
             ${{ runner.temp }}\velox-build.log
             _build/release/CMakeFiles/CMakeConfigureLog.yaml
             _build/release/vcpkg-manifest-install.log
-            .ci/vcpkg/buildtrees/**/*.log
+            .ci/vcpkg/buildtrees/*/*.log
           include-hidden-files: true
           retention-days: 7
