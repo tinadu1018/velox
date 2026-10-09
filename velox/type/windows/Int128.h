@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
-#include <type_traits>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include <folly/Conv.h>
 #include <folly/Hash.h>
@@ -31,26 +35,89 @@
 
 namespace facebook::velox {
 
+namespace detail {
+
+template <typename Floating>
+Floating int128ToFloatingPoint(uint64_t high, uint64_t low) {
+  if (high == 0) {
+    return static_cast<Floating>(low);
+  }
+
+  // Keep 64 significant bits and jam discarded nonzero bits into the low bit.
+  // Both float and double have enough guard bits here to round just once.
+  const int shift = 64 - std::countl_zero(high);
+  const uint64_t significand =
+      shift == 64 ? high : (high << (64 - shift)) | (low >> shift);
+  const bool discardedBits = (low << (64 - shift)) != 0;
+  return std::ldexp(
+      static_cast<Floating>(significand | uint64_t{discardedBits}), shift);
+}
+
+template <typename Floating>
+Floating int128ToFloatingPoint(int64_t high, uint64_t low) {
+  if (high >= 0) {
+    return int128ToFloatingPoint<Floating>(static_cast<uint64_t>(high), low);
+  }
+
+  // Convert the unsigned magnitude before applying the sign. Adding a negative
+  // high limb to a rounded positive low limb would lose small negative values.
+  const uint64_t magnitudeLow = ~low + 1;
+  const uint64_t magnitudeHigh =
+      ~static_cast<uint64_t>(high) + (magnitudeLow == 0);
+  return -int128ToFloatingPoint<Floating>(magnitudeHigh, magnitudeLow);
+}
+
+/// Divides a two-limb numerator whose high limb is smaller than the divisor.
+/// Returns the 64-bit quotient and remainder without architecture intrinsics.
+constexpr std::pair<uint64_t, uint64_t>
+divideUnsigned128By64(uint64_t high, uint64_t low, uint64_t divisor) {
+  if (divisor == 0 || high >= divisor) {
+    throw std::invalid_argument("Invalid 128-bit by 64-bit division");
+  }
+
+  uint64_t quotient{0};
+  for (int i = 0; i < 64; ++i) {
+    // The partial remainder can need 65 bits before subtracting the divisor.
+    const bool carry = (high >> 63) != 0;
+    high = (high << 1) | (low >> 63);
+    low <<= 1;
+    const bool subtract = carry || high >= divisor;
+    if (subtract) {
+      high -= divisor;
+    }
+    quotient = (quotient << 1) | uint64_t{subtract};
+  }
+  return {quotient, high};
+}
+
+} // namespace detail
+
 // Forward declarations
 class UInt128;
 
+/// Represents a signed two's-complement integer with the low limb stored first.
 class Int128 {
  public:
   constexpr Int128() : low_(0), high_(0) {}
   
   constexpr Int128(int64_t high, uint64_t low) : low_(low), high_(high) {}
-  
-  // Branchless sign-extension: `value >> 63` is an arithmetic shift on int64,
-  // producing 0 for non-negative and -1 for negative. Lowers to a single `sar`
-  // instead of a compare + cmov / branch.
-  constexpr Int128(int64_t value) : low_(static_cast<uint64_t>(value)), high_(value >> 63) {}
-  
+
+  constexpr Int128(int64_t value)
+      : low_(static_cast<uint64_t>(value)), high_(value >> 63) {}
+
   constexpr Int128(uint64_t value) : low_(value), high_(0) {}
-  
-  constexpr Int128(int32_t value) : low_(static_cast<uint64_t>(value)), high_(static_cast<int64_t>(value) >> 63) {}
-  
-  constexpr Int128(uint32_t value) : low_(value), high_(0) {}
-  
+
+  constexpr Int128(int32_t value) : Int128(static_cast<int64_t>(value)) {}
+
+  constexpr Int128(uint32_t value) : Int128(static_cast<uint64_t>(value)) {}
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr Int128(T value)
+      : Int128(
+            static_cast<
+                std::conditional_t<std::is_signed_v<T>, int64_t, uint64_t>>(
+                value)) {}
+
   constexpr Int128(const Int128& other) = default;
   constexpr Int128& operator=(const Int128& other) = default;
   
@@ -72,43 +139,44 @@ class Int128 {
   explicit operator int8_t() const { return static_cast<int8_t>(low_); }
   explicit operator uint8_t() const { return static_cast<uint8_t>(low_); }
   explicit operator double() const {
-    // Convert to double (may lose precision for very large values)
-    constexpr double k2pow64 = 18446744073709551616.0; // 2^64
-    return static_cast<double>(high_) * k2pow64 + static_cast<double>(low_);
+    return detail::int128ToFloatingPoint<double>(high_, low_);
   }
 
-  // MSVC provides no implicit Int128->float conversion; bridge through double so
-  // static_cast<float>(int128_t) compiles like it does on platforms with a
-  // native __int128. POSIX builds use the compiler builtin and never see this.
   explicit operator float() const {
-    return static_cast<float>(static_cast<double>(*this));
+    return detail::int128ToFloatingPoint<float>(high_, low_);
   }
   
   // Comparison with primitive integer types
-  constexpr bool operator<(int64_t other) const {
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator<(T other) const {
     return *this < Int128(other);
   }
-  
-  constexpr bool operator>(int64_t other) const {
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator>(T other) const {
     return *this > Int128(other);
   }
-  
-  constexpr bool operator==(int64_t other) const {
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator==(T other) const {
     return *this == Int128(other);
   }
 
-  constexpr bool operator!=(int64_t other) const {
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator!=(T other) const {
     return *this != Int128(other);
   }
 
-  constexpr bool operator<=(int64_t other) const {
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator<=(T other) const {
     return *this <= Int128(other);
   }
 
-  constexpr bool operator>=(int64_t other) const {
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr bool operator>=(T other) const {
     return *this >= Int128(other);
   }
-  
+
   // Arithmetic operators. At runtime use `_addcarry_u64`/`_subborrow_u64` so
   // MSVC lowers the 128-bit add/sub to `add; adc` / `sub; sbb` (~2 uops,
   // branch-free) instead of the previous branchy compare-and-increment carry
@@ -231,15 +299,6 @@ class Int128 {
     Int128 temp = *this;
     --(*this);
     return temp;
-  }
-  
-  // Additional assignment operators for built-in types
-  Int128& operator*=(int64_t value) {
-    return *this *= Int128(value);
-  }
-  
-  Int128& operator*=(int32_t value) {
-    return *this *= Int128(value);
   }
   
   // Specialized division by a 64-bit signed integer. Skips Int128 ctor on the
@@ -370,38 +429,22 @@ class Int128 {
     static_assert(Divisor != 0, "Divisor must be non-zero");
     return modByInt64(Divisor);
   }
-  
-  // Built-in-type division overloads. Route through the specialized 128/64
-  // path instead of constructing a full Int128 divisor and going through the
-  // general 128/128 algorithm.
-  Int128 operator/(int64_t other) const { return divideByInt64(other); }
-  Int128 operator/(int32_t other) const { return divideByInt64(other); }
-  Int128 operator/(long other) const {
-    return divideByInt64(static_cast<int64_t>(other));
+
+  // Only signed divisors fit the specialized signed 128/64 path.
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  Int128 operator/(T other) const {
+    if constexpr (std::is_signed_v<T>) {
+      return divideByInt64(static_cast<int64_t>(other));
+    } else {
+      return *this / Int128(other);
+    }
   }
-  
-  // Additional multiplication operators for compatibility with int64_t
-  Int128 operator*(int64_t other) const {
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  Int128 operator*(T other) const {
     return *this * Int128(other);
   }
-  
-  friend Int128 operator*(int64_t left, const Int128& right) {
-    return Int128(left) * right;
-  }
 
-  // Free operators for `<built-in integer> +/- Int128`. The member operator+/-
-  // only matches when the left operand is an Int128, so mixed expressions with
-  // a built-in integer on the left (e.g. `int64_t + Int128`, or smaller types
-  // that promote to int64_t) need these. Mirrors operator* above. On non-MSVC
-  // platforms int128_t is the native __int128 and these are unnecessary.
-  friend Int128 operator+(int64_t left, const Int128& right) {
-    return Int128(left) + right;
-  }
-
-  friend Int128 operator-(int64_t left, const Int128& right) {
-    return Int128(left) - right;
-  }
-  
   // Multiplication: full 128x128 -> low-128 product.
   //   (a_hi:a_lo) * (b_hi:b_lo) mod 2^128
   //     = a_lo*b_lo + ((a_lo*b_hi + a_hi*b_lo) << 64)
@@ -505,22 +548,10 @@ class Int128 {
       // Now divide (rem_hi : dividend_lo) by divisor_lo.
       // rem_hi < divisor_lo is guaranteed, so quotient fits in 64 bits.
 #if defined(_M_ARM64)
-      // ARM64 doesn't have _udiv128 intrinsic. Use binary long division.
-      // Since rem_hi < divisor_lo, the quotient fits in 64 bits.
-      uint64_t num_hi = rem_hi;
-      uint64_t num_lo = dividend_lo;
-      uint64_t quot = 0;
-      for (int i = 63; i >= 0; --i) {
-        // Shift (num_hi:num_lo) left by 1, pull next bit from num_lo
-        num_hi = (num_hi << 1) | (num_lo >> 63);
-        num_lo <<= 1;
-        if (num_hi >= divisor_lo) {
-          num_hi -= divisor_lo;
-          quot |= (1ULL << i);
-        }
-      }
-      q_lo = quot;
-      r_lo = num_hi;
+      const auto [quotient, remainder] =
+          detail::divideUnsigned128By64(rem_hi, dividend_lo, divisor_lo);
+      q_lo = quotient;
+      r_lo = remainder;
 #else
       q_lo = _udiv128(rem_hi, dividend_lo, divisor_lo, &r_lo);
 #endif
@@ -763,11 +794,12 @@ class Int128 {
     if (shift >= 128) return Int128(0, 0);
     if (shift == 0) return *this;
     if (shift >= 64) {
-      return Int128(static_cast<int64_t>(low_) << (shift - 64), 0);
+      return Int128(static_cast<int64_t>(low_ << (shift - 64)), 0);
     } else {
-      int64_t new_high = (high_ << shift) | (static_cast<int64_t>(low_) >> (64 - shift));
-      uint64_t new_low = low_ << shift;
-      return Int128(new_high, new_low);
+      // Bits crossing the limb boundary must use a logical right shift.
+      const uint64_t high =
+          (static_cast<uint64_t>(high_) << shift) | (low_ >> (64 - shift));
+      return Int128(static_cast<int64_t>(high), low_ << shift);
     }
   }
   
@@ -820,11 +852,7 @@ class Int128 {
 
     const bool negative = high_ < 0;
 
-    // Compute the unsigned magnitude directly in two's complement.  Going
-    // through `-*this` would invoke signed integer overflow UB on INT128_MIN
-    // (the operator-() implementation does `-high_` which is UB when
-    // high_ == INT64_MIN).  The unsigned ~x + 1 form is well-defined and
-    // produces the correct magnitude (2^127 for INT128_MIN).
+    // Compute the unsigned magnitude, including 2^127 for INT128_MIN.
     uint64_t hi;
     uint64_t lo;
     if (!negative) {
@@ -878,14 +906,38 @@ class Int128 {
   int64_t high_;   // Most significant 64 bits (offset 8, matches __int128_t)
 };
 
+/// Represents an unsigned integer with the low 64-bit limb stored first.
 class UInt128 {
  public:
   constexpr UInt128() : low_(0), high_(0) {}
   
   constexpr UInt128(uint64_t high, uint64_t low) : low_(low), high_(high) {}
-  
+
   constexpr UInt128(uint64_t value) : low_(value), high_(0) {}
-  
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  constexpr UInt128(T value) : low_(static_cast<uint64_t>(value)), high_(0) {
+    // Negative integral inputs convert modulo 2^128, not modulo 2^64.
+    if constexpr (std::is_signed_v<T>) {
+      high_ = static_cast<uint64_t>(static_cast<int64_t>(value) >> 63);
+    }
+  }
+
+  /// Truncates a floating-point value, rejecting non-finite or out-of-range
+  /// results rather than narrowing through a 64-bit integer.
+  template <typename T, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>
+  explicit UInt128(T value) {
+    const long double truncated = std::trunc(static_cast<long double>(value));
+    if (!std::isfinite(truncated) || truncated < 0 ||
+        truncated >= std::ldexp(1.0L, 128)) {
+      throw std::out_of_range(
+          "Floating-point value is out of range for UInt128");
+    }
+    high_ = static_cast<uint64_t>(std::ldexp(truncated, -64));
+    low_ = static_cast<uint64_t>(
+        truncated - std::ldexp(static_cast<long double>(high_), 64));
+  }
+
   constexpr UInt128(const UInt128& other) = default;
   constexpr UInt128& operator=(const UInt128& other) = default;
   
@@ -909,11 +961,10 @@ class UInt128 {
   explicit operator int8_t() const { return static_cast<int8_t>(low_); }
   explicit operator uint8_t() const { return static_cast<uint8_t>(low_); }
   explicit operator double() const {
-    return static_cast<double>(high_) * 18446744073709551616.0 +
-        static_cast<double>(low_);
+    return detail::int128ToFloatingPoint<double>(high_, low_);
   }
   explicit operator float() const {
-    return static_cast<float>(static_cast<double>(*this));
+    return detail::int128ToFloatingPoint<float>(high_, low_);
   }
   
   // Arithmetic operators. See Int128 for rationale.
@@ -1015,15 +1066,12 @@ class UInt128 {
     return UInt128(result_high, result_low);
 #endif
   }
-  
-  UInt128 operator*(int64_t other) const {
-    return *this * UInt128(static_cast<uint64_t>(other));
+
+  template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+  UInt128 operator*(T other) const {
+    return *this * UInt128(other);
   }
-  
-  friend UInt128 operator*(int64_t left, const UInt128& right) {
-    return UInt128(static_cast<uint64_t>(left)) * right;
-  }
-  
+
   UInt128& operator*=(const UInt128& other) {
     *this = *this * other;
     return *this;
@@ -1270,8 +1318,35 @@ struct hash<facebook::velox::UInt128> {
 
 // Global operators for mixed-type operations
 namespace facebook::velox {
-inline Int128 operator-(int left, const Int128& right) {
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline Int128 operator*(T left, const Int128& right) {
+  return Int128(left) * right;
+}
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline UInt128 operator*(T left, const UInt128& right) {
+  return UInt128(left) * right;
+}
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline Int128 operator+(T left, const Int128& right) {
+  return Int128(left) + right;
+}
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline UInt128 operator+(T left, const UInt128& right) {
+  return UInt128(left) + right;
+}
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline Int128 operator-(T left, const Int128& right) {
   return Int128(left) - right;
+}
+
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline UInt128 operator-(T left, const UInt128& right) {
+  return UInt128(left) - right;
 }
 } // namespace facebook::velox
 
@@ -1325,26 +1400,56 @@ toAppend(const facebook::velox::UInt128& value, Tgt* result) {
 
 } // namespace folly
 
-// Free-standing reverse comparison operators (int64_t op Int128)
+// Preserve the original width and signedness of reverse integral operands.
 namespace facebook::velox {
 
-inline constexpr bool operator<(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator<(T lhs, const Int128& rhs) {
   return Int128(lhs) < rhs;
 }
-inline constexpr bool operator>(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator<(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) < rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator>(T lhs, const Int128& rhs) {
   return Int128(lhs) > rhs;
 }
-inline constexpr bool operator<=(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator>(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) > rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator<=(T lhs, const Int128& rhs) {
   return Int128(lhs) <= rhs;
 }
-inline constexpr bool operator>=(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator<=(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) <= rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator>=(T lhs, const Int128& rhs) {
   return Int128(lhs) >= rhs;
 }
-inline constexpr bool operator==(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator>=(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) >= rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator==(T lhs, const Int128& rhs) {
   return Int128(lhs) == rhs;
 }
-inline constexpr bool operator!=(int64_t lhs, const Int128& rhs) {
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator==(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) == rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline constexpr bool operator!=(T lhs, const Int128& rhs) {
   return Int128(lhs) != rhs;
+}
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+inline bool operator!=(T lhs, const UInt128& rhs) {
+  return UInt128(lhs) != rhs;
 }
 
 } // namespace facebook::velox

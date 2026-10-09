@@ -48,6 +48,15 @@ target_link_libraries(
   glog::glog
 )
 
+if(MSVC)
+  add_executable(velox_int128_test Int128Test.cpp)
+  add_test(velox_int128_test velox_int128_test)
+  target_link_libraries(
+    velox_int128_test
+    PRIVATE Folly::folly fmt::fmt Boost::headers GTest::gtest_main
+  )
+endif()
+
 if(VELOX_ENABLE_BENCHMARKS)
   add_executable(velox_filter_benchmark FilterBenchmark.cpp)
 
